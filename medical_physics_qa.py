@@ -48,8 +48,9 @@ import pydicom
 def acr_load_dicom_slice(dicom_path):
     ds = pydicom.dcmread(dicom_path)
     pixel_array = ds.pixel_array.astype(np.float32)
-    slope = float(ds.RescaleSlope)
-    intercept = float(ds.RescaleIntercept)
+    # Use getattr fallbacks — some DICOM files omit these tags
+    slope     = float(getattr(ds, 'RescaleSlope',     1.0))
+    intercept = float(getattr(ds, 'RescaleIntercept', 0.0))
     return pixel_array * slope + intercept
 
 
@@ -152,9 +153,11 @@ def cheese_gamma_index(reference, evaluated,
                        dose_threshold=0.03, dist_threshold=3,
                        pixel_spacing=(1, 1)):
     """Simple global 2-D gamma index."""
-    ref_norm  = reference / np.max(reference)
-    eval_norm = evaluated / np.max(evaluated)
-    gamma_map = np.full_like(reference, np.inf)
+    ref_norm  = reference.astype(np.float64) / np.max(reference)
+    eval_norm = evaluated.astype(np.float64) / np.max(evaluated)
+    # Must use explicit float64 — full_like on an int array silently wraps inf to
+    # -2147483648 (confirmed NumPy 2.x behaviour), corrupting the entire gamma map.
+    gamma_map = np.full(reference.shape, np.inf, dtype=np.float64)
 
     for i in range(reference.shape[0]):
         for j in range(reference.shape[1]):
@@ -361,8 +364,12 @@ def run_field_analysis():
 # ╚══════════════════════════════════════════════════════════╝
 
 def analyze_field_profile(file_path):
-    data    = pd.read_csv(file_path, header=None).squeeze()
-    profile = data.to_numpy()
+    raw = pd.read_csv(file_path, header=None)
+    # squeeze() is ambiguous on multi-column CSVs — always take the first column
+    if raw.shape[1] > 1:
+        print(f"  ⚠️  CSV has {raw.shape[1]} columns; using column 0 as the profile.")
+    data    = raw.iloc[:, 0]
+    profile = data.to_numpy(dtype=np.float64)
     profile = profile / np.max(profile)
 
     central = profile[len(profile) // 4: 3 * len(profile) // 4]
@@ -377,18 +384,24 @@ def analyze_field_profile(file_path):
     symmetry = np.max(np.abs(left - right)) * 100
 
     above_half = np.where(profile >= 0.5)[0]
-    fwhm = above_half[-1] - above_half[0]
+    if above_half.size == 0:
+        fwhm_str = "N/A (profile never reaches 50% of max)"
+        fwhm_start = fwhm_end = None
+    else:
+        fwhm_str = str(above_half[-1] - above_half[0])
+        fwhm_start, fwhm_end = above_half[0], above_half[-1]
 
     print("\n=== Field Profile Analysis ===")
     print(f"  Flatness (central 50%): {flatness:.2f} %")
     print(f"  Symmetry (max L/R):     {symmetry:.2f} %")
-    print(f"  FWHM (pixels):          {fwhm}")
+    print(f"  FWHM (pixels):          {fwhm_str}")
     print("================================")
 
     plt.plot(profile, label='Profile')
     plt.axhline(0.5, color='r', linestyle='--', label='Half Max')
-    plt.axvline(above_half[0],  color='g', linestyle=':', label='FWHM start')
-    plt.axvline(above_half[-1], color='g', linestyle=':', label='FWHM end')
+    if fwhm_start is not None:
+        plt.axvline(fwhm_start, color='g', linestyle=':', label='FWHM start')
+        plt.axvline(fwhm_end,   color='g', linestyle=':', label='FWHM end')
     plt.title("Field Profile")
     plt.xlabel("Position (pixels or mm)")
     plt.ylabel("Normalized Dose")
@@ -466,20 +479,29 @@ def mlc_analyze_static_field(img, threshold=0.5):
     center_row = img[img.shape[0] // 2, :]
     positions  = np.arange(len(center_row))
 
-    above      = center_row >= threshold
-    indices    = np.where(above)[0]
+    above   = center_row >= threshold
+    indices = np.where(above)[0]
+    if indices.size == 0:
+        raise ValueError(
+            f"No pixels meet threshold={threshold} in centre row. "
+            "Check image normalisation."
+        )
     left_edge  = indices[0]
     right_edge = indices[-1]
     print(f"  Field edges (px): {left_edge} — {right_edge}")
     print(f"  Field size (px):  {right_edge - left_edge}")
 
+    # .astype(int) is safer than dtype=int kwarg across NumPy versions
     rows_to_check = np.linspace(
-        img.shape[0] // 4, 3 * img.shape[0] // 4, 5, dtype=int
-    )
+        img.shape[0] // 4, 3 * img.shape[0] // 4, 5
+    ).astype(int)
     leaf_positions = []
     for r in rows_to_check:
-        profile = img[r, :]
-        idx     = np.where(profile >= threshold)[0]
+        row_profile = img[r, :]
+        idx = np.where(row_profile >= threshold)[0]
+        if idx.size == 0:
+            print(f"  ⚠️  Row {r}: no pixels meet threshold — skipped.")
+            continue
         leaf_positions.append((idx[0], idx[-1]))
 
     return positions, center_row, leaf_positions
@@ -612,9 +634,11 @@ def run_planar_imaging():
 # ╚══════════════════════════════════════════════════════════╝
 
 def quart_load_dicom(path):
-    ds  = pydicom.dcmread(path)
-    img = ds.pixel_array.astype(np.float32)
-    img = img * float(ds.RescaleSlope) + float(ds.RescaleIntercept)
+    ds    = pydicom.dcmread(path)
+    img   = ds.pixel_array.astype(np.float32)
+    slope     = float(getattr(ds, 'RescaleSlope',     1.0))
+    intercept = float(getattr(ds, 'RescaleIntercept', 0.0))
+    img = img * slope + intercept
     return img
 
 
@@ -801,8 +825,11 @@ def analyze_multi_target_wl(image_folder):
               f"Couch={beam.table_angle}")
         print(f"     BBs detected: {len(beam.bb_objs)}")
         for i, bb in enumerate(beam.bb_objs, 1):
+            # cax2bb_vector is a 3-element vector, not a scalar — use its magnitude
+            vec = bb.cax2bb_vector
+            vec_mag = float(np.linalg.norm(vec)) if hasattr(vec, '__len__') else float(vec)
             print(f"       BB {i}: 2D={bb.cax2bb_distance:.3f} mm  "
-                  f"3D={bb.cax2bb_vector:.3f} mm")
+                  f"3D vector magnitude={vec_mag:.3f} mm")
 
     print(f"\n  Max 2D deviation: {wl.max_2D_distance:.3f} mm")
     print(f"  Max 3D deviation: {wl.max_3D_distance:.3f} mm")
@@ -849,7 +876,6 @@ def run_wl_multi_target():
 # ╚══════════════════════════════════════════════════════════╝
 
 def wl_load_dicom(path):
-    import cv2  # noqa — imported here
     ds  = pydicom.dcmread(path)
     img = ds.pixel_array.astype(np.float32)
     if 'RescaleSlope'     in ds: img = img * float(ds.RescaleSlope)
@@ -1012,3 +1038,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
